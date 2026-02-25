@@ -1,0 +1,714 @@
+use bstr::ByteSlice;
+
+use grep_matcher::{LineMatchKind, Matcher};
+
+use crate::{
+    line_buffer::BinaryDetection,
+    lines::{self, LineStep},
+    searcher::{Config, Range, Searcher},
+    sink::{
+        Sink, SinkContext, SinkContextKind, SinkError, SinkFinish, SinkMatch,
+    },
+};
+
+enum FastMatchResult {
+    Continue,
+    Stop,
+    SwitchToSlow,
+}
+
+#[derive(Debug)]
+pub(crate) struct Core<'s, M: 's, S> {
+    config: &'s Config,
+    matcher: M,
+    searcher: &'s Searcher,
+    sink: S,
+    binary: bool,
+    pos: usize,
+    absolute_byte_offset: u64,
+    binary_byte_offset: Option<usize>,
+    line_number: Option<u64>,
+    last_line_counted: usize,
+    last_line_visited: usize,
+    after_context_left: usize,
+    has_sunk: bool,
+    has_matched: bool,
+    count: u64,
+}
+
+impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+    pub(crate) fn new(
+        searcher: &'s Searcher,
+        matcher: M,
+        sink: S,
+        binary: bool,
+    ) -> Core<'s, M, S> {
+        let line_number =
+            if searcher.config.line_number { Some(1) } else { None };
+        let core = Core {
+            config: &searcher.config,
+            matcher,
+            searcher,
+            sink,
+            binary,
+            pos: 0,
+            absolute_byte_offset: 0,
+            binary_byte_offset: None,
+            line_number,
+            last_line_counted: 0,
+            last_line_visited: 0,
+            after_context_left: 0,
+            has_sunk: false,
+            has_matched: false,
+            count: 0,
+        };
+        if !core.searcher.multi_line_with_matcher(&core.matcher) {
+            if core.is_line_by_line_fast() {
+                log::trace!("searcher core: будет использоваться быстрый построчный поиск");
+            } else {
+                log::trace!("searcher core: будет использоваться медленный построчный поиск");
+            }
+        }
+        core
+    }
+
+    pub(crate) fn pos(&self) -> usize {
+        self.pos
+    }
+
+    pub(crate) fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn increment_count(&mut self) {
+        self.count += 1;
+    }
+
+    pub(crate) fn binary_byte_offset(&self) -> Option<u64> {
+        self.binary_byte_offset.map(|offset| offset as u64)
+    }
+
+    pub(crate) fn matcher(&self) -> &M {
+        &self.matcher
+    }
+
+    pub(crate) fn matched(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        self.sink_matched(buf, range)
+    }
+
+    pub(crate) fn binary_data(
+        &mut self,
+        binary_byte_offset: u64,
+    ) -> Result<bool, S::Error> {
+        self.sink.binary_data(&self.searcher, binary_byte_offset)
+    }
+
+    fn is_match(&self, line: &[u8]) -> Result<bool, S::Error> {
+        // Нам нужно удалить завершитель строки здесь, чтобы сопоставить
+        // семантику построчного поиска. А именно, regex-выражения
+        // вроде `(?m)^$` могут совпадать в конечной позиции за
+        // завершителем строки, что бессмысленно в построчном
+        // сопоставлении.
+        let line = lines::without_terminator(line, self.config.line_term);
+        self.matcher.is_match(line).map_err(S::Error::error_message)
+    }
+
+    pub(crate) fn find(
+        &mut self,
+        slice: &[u8],
+    ) -> Result<Option<Range>, S::Error> {
+        if self.has_exceeded_match_limit() {
+            return Ok(None);
+        }
+        match self.matcher().find(slice) {
+            Err(err) => Err(S::Error::error_message(err)),
+            Ok(None) => Ok(None),
+            Ok(Some(m)) => {
+                self.increment_count();
+                Ok(Some(m))
+            }
+        }
+    }
+
+    fn shortest_match(
+        &mut self,
+        slice: &[u8],
+    ) -> Result<Option<usize>, S::Error> {
+        if self.has_exceeded_match_limit() {
+            return Ok(None);
+        }
+        match self.matcher.shortest_match(slice) {
+            Err(err) => return Err(S::Error::error_message(err)),
+            Ok(None) => return Ok(None),
+            Ok(Some(m)) => Ok(Some(m)),
+        }
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<bool, S::Error> {
+        self.sink.begin(&self.searcher)
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        byte_count: u64,
+        binary_byte_offset: Option<u64>,
+    ) -> Result<(), S::Error> {
+        self.sink.finish(
+            &self.searcher,
+            &SinkFinish { byte_count, binary_byte_offset },
+        )
+    }
+
+    pub(crate) fn match_by_line(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<bool, S::Error> {
+        if self.is_line_by_line_fast() {
+            match self.match_by_line_fast(buf)? {
+                FastMatchResult::SwitchToSlow => self.match_by_line_slow(buf),
+                FastMatchResult::Continue => Ok(true),
+                FastMatchResult::Stop => Ok(false),
+            }
+        } else {
+            self.match_by_line_slow(buf)
+        }
+    }
+
+    pub(crate) fn roll(&mut self, buf: &[u8]) -> usize {
+        let consumed = if self.config.max_context() == 0 {
+            buf.len()
+        } else {
+            // Может показаться, что нам нужно заботиться только о
+            // "контексте до", но для того, чтобы передать разделитель
+            // контекста (когда before_context==0 и after_context>0), нам
+            // нужно знать что-то о позиции предыдущей посещённой строки,
+            // даже если мы находимся в начале буфера.
+            //
+            // ... однако нам нужно найти только N preceding строк на основе
+            // контекста до. Мы можем пропустить этот (потенциально дорогой
+            // для больших значений N) шаг, когда before_context==0.
+            let context_start = lines::preceding(
+                buf,
+                self.config.line_term.as_byte(),
+                self.config.before_context,
+            );
+            let consumed =
+                std::cmp::max(context_start, self.last_line_visited);
+            consumed
+        };
+        self.count_lines(buf, consumed);
+        self.absolute_byte_offset += consumed as u64;
+        self.last_line_counted = 0;
+        self.last_line_visited = 0;
+        self.set_pos(buf.len() - consumed);
+        consumed
+    }
+
+    pub(crate) fn detect_binary(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        if self.binary_byte_offset.is_some() {
+            return Ok(self.config.binary.quit_byte().is_some());
+        }
+        let binary_byte = match self.config.binary.0 {
+            BinaryDetection::Quit(b) => b,
+            BinaryDetection::Convert(b) => b,
+            _ => return Ok(false),
+        };
+        if let Some(i) = buf[*range].find_byte(binary_byte) {
+            let offset = range.start() + i;
+            self.binary_byte_offset = Some(offset);
+            if !self.binary_data(offset as u64)? {
+                return Ok(true);
+            }
+            Ok(self.config.binary.quit_byte().is_some())
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub(crate) fn before_context_by_line(
+        &mut self,
+        buf: &[u8],
+        upto: usize,
+    ) -> Result<bool, S::Error> {
+        if self.config.before_context == 0 {
+            return Ok(true);
+        }
+        let range = Range::new(self.last_line_visited, upto);
+        if range.is_empty() {
+            return Ok(true);
+        }
+        let before_context_start = range.start()
+            + lines::preceding(
+                &buf[range],
+                self.config.line_term.as_byte(),
+                self.config.before_context - 1,
+            );
+
+        let range = Range::new(before_context_start, range.end());
+        let mut stepper = LineStep::new(
+            self.config.line_term.as_byte(),
+            range.start(),
+            range.end(),
+        );
+        while let Some(line) = stepper.next_match(buf) {
+            if !self.sink_break_context(line.start())? {
+                return Ok(false);
+            }
+            if !self.sink_before_context(buf, &line)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn after_context_by_line(
+        &mut self,
+        buf: &[u8],
+        upto: usize,
+    ) -> Result<bool, S::Error> {
+        if self.after_context_left == 0 {
+            return Ok(true);
+        }
+        let exceeded_match_limit = self.has_exceeded_match_limit();
+        let range = Range::new(self.last_line_visited, upto);
+        let mut stepper = LineStep::new(
+            self.config.line_term.as_byte(),
+            range.start(),
+            range.end(),
+        );
+        while let Some(line) = stepper.next_match(buf) {
+            if exceeded_match_limit
+                && self.is_match(&buf[line])? != self.config.invert_match
+            {
+                let after_context_left = self.after_context_left;
+                self.set_pos(line.end());
+                if !self.sink_matched(buf, &line)? {
+                    return Ok(false);
+                }
+                self.after_context_left = after_context_left - 1;
+            } else if !self.sink_after_context(buf, &line)? {
+                return Ok(false);
+            }
+            if self.after_context_left == 0 {
+                break;
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn other_context_by_line(
+        &mut self,
+        buf: &[u8],
+        upto: usize,
+    ) -> Result<bool, S::Error> {
+        let range = Range::new(self.last_line_visited, upto);
+        let mut stepper = LineStep::new(
+            self.config.line_term.as_byte(),
+            range.start(),
+            range.end(),
+        );
+        while let Some(line) = stepper.next_match(buf) {
+            if !self.sink_other_context(buf, &line)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn match_by_line_slow(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
+        debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
+
+        let range = Range::new(self.pos(), buf.len());
+        let mut stepper = LineStep::new(
+            self.config.line_term.as_byte(),
+            range.start(),
+            range.end(),
+        );
+        while let Some(line) = stepper.next_match(buf) {
+            if self.has_exceeded_match_limit()
+                && !self.config.passthru
+                && self.after_context_left == 0
+            {
+                return Ok(false);
+            }
+            let matched = {
+                // Удаление завершителя строки необходимо для предотвращения
+                // некоторых классов regex-выражений от сопоставления пустой
+                // позиции *после* конца строки. Например, `(?m)^$` будет
+                // совпадать в позиции (2, 2) в строке `a\n`.
+                let slice = lines::without_terminator(
+                    &buf[line],
+                    self.config.line_term,
+                );
+                self.shortest_match(slice)?.is_some()
+            };
+            self.set_pos(line.end());
+
+            let success = matched != self.config.invert_match;
+            if success {
+                self.has_matched = true;
+                self.increment_count();
+                if !self.before_context_by_line(buf, line.start())? {
+                    return Ok(false);
+                }
+                if !self.sink_matched(buf, &line)? {
+                    return Ok(false);
+                }
+            } else if self.after_context_left >= 1 {
+                if !self.sink_after_context(buf, &line)? {
+                    return Ok(false);
+                }
+            } else if self.config.passthru {
+                if !self.sink_other_context(buf, &line)? {
+                    return Ok(false);
+                }
+            }
+            if self.config.stop_on_nonmatch && !success && self.has_matched {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn match_by_line_fast(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<FastMatchResult, S::Error> {
+        use FastMatchResult::*;
+
+        debug_assert!(!self.config.passthru);
+        while !buf[self.pos()..].is_empty() {
+            if self.config.stop_on_nonmatch && self.has_matched {
+                return Ok(SwitchToSlow);
+            }
+            if self.config.invert_match {
+                if !self.match_by_line_fast_invert(buf)? {
+                    break;
+                }
+            } else if let Some(line) = self.find_by_line_fast(buf)? {
+                self.has_matched = true;
+                self.increment_count();
+                if self.config.max_context() > 0 {
+                    if !self.after_context_by_line(buf, line.start())? {
+                        return Ok(Stop);
+                    }
+                    if !self.before_context_by_line(buf, line.start())? {
+                        return Ok(Stop);
+                    }
+                }
+                self.set_pos(line.end());
+                if !self.sink_matched(buf, &line)? {
+                    return Ok(Stop);
+                }
+            } else {
+                break;
+            }
+        }
+        if !self.after_context_by_line(buf, buf.len())? {
+            return Ok(Stop);
+        }
+        if self.has_exceeded_match_limit() && self.after_context_left == 0 {
+            return Ok(Stop);
+        }
+        self.set_pos(buf.len());
+        Ok(Continue)
+    }
+
+    #[inline(always)]
+    fn match_by_line_fast_invert(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<bool, S::Error> {
+        assert!(self.config.invert_match);
+
+        let invert_match = match self.find_by_line_fast(buf)? {
+            None => {
+                let range = Range::new(self.pos(), buf.len());
+                self.set_pos(range.end());
+                range
+            }
+            Some(line) => {
+                let range = Range::new(self.pos(), line.start());
+                self.set_pos(line.end());
+                range
+            }
+        };
+        if invert_match.is_empty() {
+            return Ok(true);
+        }
+        self.has_matched = true;
+        if !self.after_context_by_line(buf, invert_match.start())? {
+            return Ok(false);
+        }
+        if !self.before_context_by_line(buf, invert_match.start())? {
+            return Ok(false);
+        }
+        let mut stepper = LineStep::new(
+            self.config.line_term.as_byte(),
+            invert_match.start(),
+            invert_match.end(),
+        );
+        while let Some(line) = stepper.next_match(buf) {
+            self.increment_count();
+            if !self.sink_matched(buf, &line)? {
+                return Ok(false);
+            }
+            if self.has_exceeded_match_limit() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline(always)]
+    fn find_by_line_fast(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<Option<Range>, S::Error> {
+        debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
+        debug_assert!(self.is_line_by_line_fast());
+
+        let mut pos = self.pos();
+        while !buf[pos..].is_empty() {
+            if self.has_exceeded_match_limit() {
+                return Ok(None);
+            }
+            match self.matcher.find_candidate_line(&buf[pos..]) {
+                Err(err) => return Err(S::Error::error_message(err)),
+                Ok(None) => return Ok(None),
+                Ok(Some(LineMatchKind::Confirmed(i))) => {
+                    let line = lines::locate(
+                        buf,
+                        self.config.line_term.as_byte(),
+                        Range::zero(i).offset(pos),
+                    );
+                    // Если мы сопоставили за пределами конца буфера, то
+                    // не сообщаем об этом как о совпадении.
+                    if line.start() == buf.len() {
+                        pos = buf.len();
+                        continue;
+                    }
+                    return Ok(Some(line));
+                }
+                Ok(Some(LineMatchKind::Candidate(i))) => {
+                    let line = lines::locate(
+                        buf,
+                        self.config.line_term.as_byte(),
+                        Range::zero(i).offset(pos),
+                    );
+                    if self.is_match(&buf[line])? {
+                        return Ok(Some(line));
+                    }
+                    pos = line.end();
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline(always)]
+    fn sink_matched(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        if self.binary && self.detect_binary(buf, range)? {
+            return Ok(false);
+        }
+        if !self.sink_break_context(range.start())? {
+            return Ok(false);
+        }
+        self.count_lines(buf, range.start());
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let linebuf = &buf[*range];
+        let keepgoing = self.sink.matched(
+            &self.searcher,
+            &SinkMatch {
+                line_term: self.config.line_term,
+                bytes: linebuf,
+                absolute_byte_offset: offset,
+                line_number: self.line_number,
+                buffer: buf,
+                bytes_range_in_buffer: range.start()..range.end(),
+            },
+        )?;
+        if !keepgoing {
+            return Ok(false);
+        }
+        self.last_line_visited = range.end();
+        self.after_context_left = self.config.after_context;
+        self.has_sunk = true;
+        Ok(true)
+    }
+
+    fn sink_before_context(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        if self.binary && self.detect_binary(buf, range)? {
+            return Ok(false);
+        }
+        self.count_lines(buf, range.start());
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let keepgoing = self.sink.context(
+            &self.searcher,
+            &SinkContext {
+                #[cfg(test)]
+                line_term: self.config.line_term,
+                bytes: &buf[*range],
+                kind: SinkContextKind::Before,
+                absolute_byte_offset: offset,
+                line_number: self.line_number,
+            },
+        )?;
+        if !keepgoing {
+            return Ok(false);
+        }
+        self.last_line_visited = range.end();
+        self.has_sunk = true;
+        Ok(true)
+    }
+
+    fn sink_after_context(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        assert!(self.after_context_left >= 1);
+
+        if self.binary && self.detect_binary(buf, range)? {
+            return Ok(false);
+        }
+        self.count_lines(buf, range.start());
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let keepgoing = self.sink.context(
+            &self.searcher,
+            &SinkContext {
+                #[cfg(test)]
+                line_term: self.config.line_term,
+                bytes: &buf[*range],
+                kind: SinkContextKind::After,
+                absolute_byte_offset: offset,
+                line_number: self.line_number,
+            },
+        )?;
+        if !keepgoing {
+            return Ok(false);
+        }
+        self.last_line_visited = range.end();
+        self.after_context_left -= 1;
+        self.has_sunk = true;
+        Ok(true)
+    }
+
+    fn sink_other_context(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        if self.binary && self.detect_binary(buf, range)? {
+            return Ok(false);
+        }
+        self.count_lines(buf, range.start());
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let keepgoing = self.sink.context(
+            &self.searcher,
+            &SinkContext {
+                #[cfg(test)]
+                line_term: self.config.line_term,
+                bytes: &buf[*range],
+                kind: SinkContextKind::Other,
+                absolute_byte_offset: offset,
+                line_number: self.line_number,
+            },
+        )?;
+        if !keepgoing {
+            return Ok(false);
+        }
+        self.last_line_visited = range.end();
+        self.has_sunk = true;
+        Ok(true)
+    }
+
+    fn sink_break_context(
+        &mut self,
+        start_of_line: usize,
+    ) -> Result<bool, S::Error> {
+        let is_gap = self.last_line_visited < start_of_line;
+        let any_context =
+            self.config.before_context > 0 || self.config.after_context > 0;
+
+        if !any_context || !self.has_sunk || !is_gap {
+            Ok(true)
+        } else {
+            self.sink.context_break(&self.searcher)
+        }
+    }
+
+    fn count_lines(&mut self, buf: &[u8], upto: usize) {
+        if let Some(ref mut line_number) = self.line_number {
+            if self.last_line_counted >= upto {
+                return;
+            }
+            let slice = &buf[self.last_line_counted..upto];
+            let count = lines::count(slice, self.config.line_term.as_byte());
+            *line_number += count;
+            self.last_line_counted = upto;
+        }
+    }
+
+    fn is_line_by_line_fast(&self) -> bool {
+        debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
+
+        if self.config.passthru {
+            return false;
+        }
+        if self.config.stop_on_nonmatch && self.has_matched {
+            return false;
+        }
+        if let Some(line_term) = self.matcher.line_terminator() {
+            // FIXME: Это обходит ошибку в grep-regex, где не устанавливается
+            // завершитель строки самого regex, и поэтому якоря строк,
+            // такие как `(?m:^)` и `(?m:$)`, не будут совпадать ни с чем,
+            // кроме `\n`. Поэтому пока мы просто отключаем быстрый
+            // построчный поисковик, который требует, чтобы regex мог
+            // корректно обрабатывать завершители строк. Медленный
+            // построчный поисковик удаляет завершители строк и тем самым
+            // избавляет движок regex от необходимости заботиться о том,
+            // являются ли они `\n` или NUL.
+            if line_term.as_byte() == b'\x00' {
+                return false;
+            }
+            if line_term == self.config.line_term {
+                return true;
+            }
+        }
+        if let Some(non_matching) = self.matcher.non_matching_bytes() {
+            // Если завершитель строк — CRLF, нам на самом деле не нужно
+            // заботиться о том, может ли regex сопоставить `\r` или нет.
+            // А именно, `\r` не является ни необходимым, ни достаточным
+            // для завершения строки. Всегда требуется `\n`.
+            if non_matching.contains(self.config.line_term.as_byte()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_exceeded_match_limit(&self) -> bool {
+        self.config.max_matches.map_or(false, |limit| self.count() >= limit)
+    }
+}
